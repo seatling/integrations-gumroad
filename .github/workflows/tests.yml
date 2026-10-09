@@ -1,0 +1,29 @@
+# Testing workflow
+name: tests
+
+# This GitHub action runs tests for each pull request and push.
+on:
+  push:
+
+# Testing only needs permissions to read the repository contents.
+permissions:
+  contents: read
+
+jobs:
+  # Ensure project builds before running testing matrix
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go mod download
+      - run: ./test.sh
+        env:
+          GUMROAD_ACCESS_TOKEN: ${{ secrets.GUMROAD_ACCESS_TOKEN }}
+          GUMROAD_PRODUCT_ID: ${{ secrets.GUMROAD_PRODUCT_ID }}
+          GUMROAD_LICENSE_KEY: ${{ secrets.GUMROAD_LICENSE_KEY }}
