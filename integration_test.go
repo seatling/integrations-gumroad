@@ -17,7 +17,7 @@ func getIntegrationToken(t *testing.T) string {
 		token = strings.TrimSpace(os.Getenv("GUMROAD_TOKEN"))
 	}
 	if token == "" {
-		t.Fatalf("skipping live Gumroad integration test: GUMROAD_ACCESS_TOKEN is not set")
+		t.Skip("skipping live Gumroad integration test: GUMROAD_ACCESS_TOKEN is not set")
 	}
 	return token
 }
@@ -103,7 +103,7 @@ func TestIntegration_VerifyLicense(t *testing.T) {
 	licenseKey := strings.TrimSpace(os.Getenv("GUMROAD_LICENSE_KEY"))
 
 	if productID == "" || licenseKey == "" {
-		t.Fatalf("skipping live VerifyLicense integration test: GUMROAD_PRODUCT_ID and/or GUMROAD_LICENSE_KEY not set")
+		t.Skip("skipping live VerifyLicense integration test: GUMROAD_PRODUCT_ID and/or GUMROAD_LICENSE_KEY not set")
 	}
 
 	client := gumroad.New()

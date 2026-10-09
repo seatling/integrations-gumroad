@@ -564,6 +564,8 @@ func (c *Client) ParseWebhookPayload(payload []byte, headers http.Header, secret
 	}
 
 	trimmed := bytes.TrimSpace(payload)
+	trimmed = bytes.TrimPrefix(trimmed, []byte("\xef\xbb\xbf"))
+	trimmed = bytes.TrimSpace(trimmed)
 	if len(trimmed) == 0 {
 		return nil, integrations.ErrInvalidPayload
 	}
@@ -597,7 +599,11 @@ func (c *Client) ParseWebhookPayload(payload []byte, headers http.Header, secret
 
 // verifySecret validates the provided secret token against request query params, headers, or payload.
 func verifySecret(reqURL *url.URL, headers http.Header, payload []byte, secret string) bool {
-	secBytes := []byte(secret)
+	cleanSecret := strings.TrimSpace(secret)
+	if cleanSecret == "" {
+		return false
+	}
+	secBytes := []byte(cleanSecret)
 
 	// 1. Query parameter
 	if reqURL != nil {
@@ -634,22 +640,41 @@ func verifySecret(reqURL *url.URL, headers http.Header, payload []byte, secret s
 
 		// 3. HMAC-SHA256 signature header if provided
 		if sig := headers.Get("X-Gumroad-Signature"); sig != "" {
+			cleanSig := strings.TrimSpace(sig)
+			cleanSig = strings.TrimPrefix(cleanSig, "sha256=")
+			cleanSig = strings.TrimPrefix(cleanSig, "SHA256=")
 			mac := hmac.New(sha256.New, secBytes)
 			mac.Write(payload)
 			expectedMAC := hex.EncodeToString(mac.Sum(nil))
-			if subtle.ConstantTimeCompare([]byte(strings.ToLower(sig)), []byte(strings.ToLower(expectedMAC))) == 1 {
+			if subtle.ConstantTimeCompare([]byte(strings.ToLower(cleanSig)), []byte(strings.ToLower(expectedMAC))) == 1 {
 				return true
 			}
 		}
 	}
 
-	// 4. In form / url-encoded payload
-	if len(payload) > 0 && payload[0] != '{' {
-		if vals, err := url.ParseQuery(string(payload)); err == nil {
-			for _, param := range []string{"secret", "token", "passcode", "key"} {
-				if val := vals.Get(param); val != "" {
-					if subtle.ConstantTimeCompare([]byte(val), secBytes) == 1 {
-						return true
+	// 4. In form / url-encoded or JSON payload
+	trimmed := bytes.TrimSpace(payload)
+	trimmed = bytes.TrimPrefix(trimmed, []byte("\xef\xbb\xbf"))
+	trimmed = bytes.TrimSpace(trimmed)
+	if len(trimmed) > 0 {
+		if trimmed[0] == '{' {
+			var jMap map[string]any
+			if json.Unmarshal(trimmed, &jMap) == nil {
+				for _, param := range []string{"secret", "token", "passcode", "key"} {
+					if val, ok := jMap[param]; ok && val != nil {
+						if subtle.ConstantTimeCompare([]byte(fmt.Sprintf("%v", val)), secBytes) == 1 {
+							return true
+						}
+					}
+				}
+			}
+		} else {
+			if vals, err := url.ParseQuery(string(trimmed)); err == nil {
+				for _, param := range []string{"secret", "token", "passcode", "key"} {
+					if val := vals.Get(param); val != "" {
+						if subtle.ConstantTimeCompare([]byte(val), secBytes) == 1 {
+							return true
+						}
 					}
 				}
 			}
@@ -659,11 +684,131 @@ func verifySecret(reqURL *url.URL, headers http.Header, payload []byte, secret s
 	return false
 }
 
+// parseDictString extracts key-value pairs from a dictionary string formatted like "{'size' : 'large', 'color' : 'red'}"
+// as documented in Gumroad's Ping specification (https://gumroad.com/ping).
+func parseDictString(s string) map[string]string {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		return nil
+	}
+
+	result := make(map[string]string)
+	// Try unmarshaling after standardizing single quotes to double quotes
+	replaced := strings.ReplaceAll(trimmed, "'", "\"")
+	var jMap map[string]any
+	if err := json.Unmarshal([]byte(replaced), &jMap); err == nil {
+		for k, v := range jMap {
+			if v != nil {
+				result[k] = fmt.Sprintf("%v", v)
+			}
+		}
+		return result
+	}
+
+	// Scanner fallback for unquoted or malformed key-value pairs
+	inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	if inner == "" {
+		return result
+	}
+
+	for _, part := range strings.Split(inner, ",") {
+		kv := strings.SplitN(part, ":", 2)
+		if len(kv) == 2 {
+			k := strings.Trim(strings.TrimSpace(kv[0]), `'" `)
+			v := strings.Trim(strings.TrimSpace(kv[1]), `'" `)
+			if k != "" {
+				result[k] = v
+			}
+		}
+	}
+
+	return result
+}
+
+// officialPingFields defines the complete, strict set of 39 parameters documented in the
+// official Gumroad Ping specification (https://gumroad.com/ping).
+var officialPingFields = map[string]struct{}{
+	"sale_id":                       {},
+	"sale_timestamp":                {},
+	"order_number":                  {},
+	"seller_id":                     {},
+	"product_id":                    {},
+	"product_permalink":             {},
+	"short_product_id":              {},
+	"product_name":                  {},
+	"email":                         {},
+	"url_params":                    {},
+	"full_name":                     {},
+	"purchaser_id":                  {},
+	"subscription_id":               {},
+	"ip_country":                    {},
+	"price":                         {},
+	"recurrence":                    {},
+	"variants":                      {},
+	"offer_code":                    {},
+	"test":                          {},
+	"custom_fields":                 {},
+	"shipping_information":          {},
+	"is_recurring_charge":           {},
+	"is_preorder_authorization":     {},
+	"license_key":                   {},
+	"quantity":                      {},
+	"shipping_rate":                 {},
+	"affiliate":                     {},
+	"affiliate_credit_amount_cents": {},
+	"is_gift_receiver_purchase":     {},
+	"gifter_email":                  {},
+	"gift_price":                    {},
+	"refunded":                      {},
+	"discover_fee_charged":          {},
+	"can_contact":                   {},
+	"referrer":                      {},
+	"gumroad_fee":                   {},
+	"card":                          {},
+	"resource_name":                 {},
+	"retry_count":                   {},
+}
+
+// isOfficialPingKey reports whether key is one of the 39 official Gumroad Ping parameters
+// or a bracket-indexed subkey of an official dictionary parameter (e.g. custom_fields[...]).
+func isOfficialPingKey(key string) bool {
+	if _, ok := officialPingFields[key]; ok {
+		return true
+	}
+	for _, prefix := range []string{
+		"custom_fields[",
+		"url_params[",
+		"variants[",
+		"shipping_information[",
+		"card[",
+	} {
+		if strings.HasPrefix(key, prefix) && strings.HasSuffix(key, "]") {
+			return true
+		}
+	}
+	return false
+}
+
+// filterOfficialPingFields strips any parameters that are not part of the official Gumroad Ping definition.
+func filterOfficialPingFields(raw map[string]any) map[string]any {
+	filtered := make(map[string]any, len(raw))
+	for k, v := range raw {
+		if isOfficialPingKey(k) {
+			filtered[k] = v
+		}
+	}
+	return filtered
+}
+
 // normalizeGumroadWebhook converts the parsed Gumroad payload into a standard NormalizedWebhookEvent.
+// It filters incoming parameters to strictly retain only fields defined in the official Gumroad Ping specification.
 func normalizeGumroadWebhook(raw map[string]any) (*integrations.NormalizedWebhookEvent, error) {
+	// Filter raw map so no non-spec fields are retained in NormalizedWebhookEvent.RawPayload or Order.RawData.
+	raw = filterOfficialPingFields(raw)
+
 	getString := func(key string) string {
 		if v, ok := raw[key]; ok && v != nil {
-			return fmt.Sprintf("%v", v)
+			return strings.TrimSpace(fmt.Sprintf("%v", v))
 		}
 		return ""
 	}
@@ -673,8 +818,13 @@ func normalizeGumroadWebhook(raw map[string]any) (*integrations.NormalizedWebhoo
 			switch b := v.(type) {
 			case bool:
 				return b
+			case int:
+				return b == 1
+			case float64:
+				return b == 1
 			case string:
-				return strings.EqualFold(b, "true") || b == "1"
+				s := strings.TrimSpace(strings.ToLower(b))
+				return s == "true" || s == "1" || s == "yes" || s == "t"
 			}
 		}
 		return false
@@ -688,10 +838,14 @@ func normalizeGumroadWebhook(raw map[string]any) (*integrations.NormalizedWebhoo
 			case int:
 				return n
 			case string:
-				if i, err := strconv.Atoi(n); err == nil {
+				s := strings.TrimSpace(n)
+				s = strings.TrimPrefix(s, "$")
+				s = strings.TrimPrefix(s, "€")
+				s = strings.TrimPrefix(s, "£")
+				if i, err := strconv.Atoi(s); err == nil {
 					return i
 				}
-				if f, err := strconv.ParseFloat(n, 64); err == nil {
+				if f, err := strconv.ParseFloat(s, 64); err == nil {
 					return int(f)
 				}
 			}
@@ -699,27 +853,90 @@ func normalizeGumroadWebhook(raw map[string]any) (*integrations.NormalizedWebhoo
 		return 0
 	}
 
+	parseTimestamp := func(keys ...string) (time.Time, bool) {
+		layouts := []string{
+			"2006-01-02 15:04:05 MST",
+			"2006-01-02 15:04:05 UTC",
+			time.RFC3339,
+			time.RFC3339Nano,
+			"2006-01-02T15:04:05-0700",
+			"2006-01-02 15:04:05",
+			"2006-01-02",
+		}
+		for _, key := range keys {
+			val, ok := raw[key]
+			if !ok || val == nil {
+				continue
+			}
+			switch v := val.(type) {
+			case float64:
+				if v > 0 {
+					sec := int64(v)
+					if sec > 1e11 {
+						return time.UnixMilli(sec).UTC(), true
+					}
+					return time.Unix(sec, 0).UTC(), true
+				}
+			case int:
+				if v > 0 {
+					return time.Unix(int64(v), 0).UTC(), true
+				}
+			case string:
+				s := strings.TrimSpace(v)
+				if s == "" {
+					continue
+				}
+				if sec, err := strconv.ParseInt(s, 10, 64); err == nil && sec > 0 {
+					if sec > 1e11 {
+						return time.UnixMilli(sec).UTC(), true
+					}
+					return time.Unix(sec, 0).UTC(), true
+				}
+				for _, layout := range layouts {
+					if t, err := time.Parse(layout, s); err == nil {
+						return t.UTC(), true
+					}
+				}
+			}
+		}
+		return time.Time{}, false
+	}
+
 	saleID := getString("sale_id")
 	if saleID == "" {
 		saleID = getString("order_number")
 	}
-	if saleID == "" {
-		saleID = getString("id")
-	}
 
 	productID := getString("product_id")
+	if productID == "" {
+		productID = getString("short_product_id")
+	}
+	if productID == "" {
+		productID = getString("product_permalink")
+	}
+
 	sellerID := getString("seller_id")
 	email := getString("email")
 	fullName := getString("full_name")
-	currency := strings.ToLower(getString("currency"))
 	priceCents := getInt("price")
 	licenseKey := getString("license_key")
 	subscriptionID := getString("subscription_id")
 	resourceName := strings.ToLower(getString("resource_name"))
 
+	customerID := getString("purchaser_id")
+	if customerID == "" {
+		customerID = email
+	}
+
 	refunded := getBool("refunded")
-	disputed := getBool("disputed") || getBool("chargebacked")
-	cancelled := getString("subscription_cancelled_at") != "" || getBool("cancelled")
+	refundedAmountCents := 0
+	if refunded || resourceName == "refund" {
+		refunded = true
+		// Gumroad Ping does not send refunded_amount_cents; it sends refunded=true for the reversed sale
+		refundedAmountCents = priceCents
+	}
+	disputed := resourceName == "dispute"
+	cancelled := resourceName == "cancellation"
 
 	// Determine normalized event type
 	var eventType integrations.EventType
@@ -728,8 +945,12 @@ func normalizeGumroadWebhook(raw map[string]any) (*integrations.NormalizedWebhoo
 		eventType = integrations.EventTypeOrderRefunded
 	case resourceName == "dispute" || disputed:
 		eventType = integrations.EventTypeOrderDisputed
+	case resourceName == "order_cancelled" || resourceName == "order.cancelled":
+		eventType = integrations.EventTypeOrderCancelled
 	case resourceName == "cancellation" || cancelled:
 		eventType = integrations.EventTypeSubscriptionCancelled
+	case resourceName == "subscription_paused":
+		eventType = integrations.EventTypeSubscriptionPaused
 	case resourceName == "subscription_updated":
 		eventType = integrations.EventTypeSubscriptionUpdated
 	case resourceName == "subscription_ended":
@@ -747,19 +968,90 @@ func normalizeGumroadWebhook(raw map[string]any) (*integrations.NormalizedWebhoo
 	}
 
 	occurredAt := time.Now().UTC()
-	if tsStr := getString("created_at"); tsStr != "" {
-		if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
-			occurredAt = t.UTC()
+	if t, ok := parseTimestamp("sale_timestamp"); ok {
+		occurredAt = t
+	}
+
+	var variantName string
+	if vm, ok := raw["variants"].(map[string]any); ok {
+		var parts []string
+		for k, v := range vm {
+			parts = append(parts, fmt.Sprintf("%s: %v", k, v))
 		}
-	} else if tsStr := getString("order_date"); tsStr != "" {
-		if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
-			occurredAt = t.UTC()
+		variantName = strings.Join(parts, ", ")
+	} else if vs, ok := raw["variants"].([]any); ok {
+		var parts []string
+		for _, v := range vs {
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		variantName = strings.Join(parts, ", ")
+	} else if s := getString("variants"); s != "" {
+		if dict := parseDictString(s); len(dict) > 0 {
+			var parts []string
+			for k, v := range dict {
+				parts = append(parts, fmt.Sprintf("%s: %v", k, v))
+			}
+			variantName = strings.Join(parts, ", ")
+		} else {
+			variantName = s
 		}
 	}
 
-	variantName := getString("variants")
 	if variantName == "" {
-		variantName = getString("variant")
+		var parts []string
+		for k, v := range raw {
+			if strings.HasPrefix(k, "variants[") && strings.HasSuffix(k, "]") {
+				tier := strings.TrimSuffix(strings.TrimPrefix(k, "variants["), "]")
+				parts = append(parts, fmt.Sprintf("%s: %v", tier, v))
+			}
+		}
+		if len(parts) > 0 {
+			variantName = strings.Join(parts, ", ")
+		}
+	}
+
+	customFields := make(map[string]string)
+	for k, v := range raw {
+		if strings.HasPrefix(k, "custom_fields[") && strings.HasSuffix(k, "]") {
+			fieldName := strings.TrimSuffix(strings.TrimPrefix(k, "custom_fields["), "]")
+			if fieldName != "" && v != nil {
+				customFields[fieldName] = fmt.Sprintf("%v", v)
+			}
+		} else if strings.HasPrefix(k, "url_params[") && strings.HasSuffix(k, "]") {
+			paramName := strings.TrimSuffix(strings.TrimPrefix(k, "url_params["), "]")
+			if paramName != "" && v != nil {
+				customFields[paramName] = fmt.Sprintf("%v", v)
+			}
+		}
+	}
+	if cf, ok := raw["custom_fields"].(map[string]any); ok {
+		for k, v := range cf {
+			if v != nil {
+				customFields[k] = fmt.Sprintf("%v", v)
+			}
+		}
+	} else if cfStr := getString("custom_fields"); cfStr != "" {
+		for k, v := range parseDictString(cfStr) {
+			customFields[k] = v
+		}
+	}
+	if up, ok := raw["url_params"].(map[string]any); ok {
+		for k, v := range up {
+			if v != nil {
+				customFields[k] = fmt.Sprintf("%v", v)
+			}
+		}
+	} else if upStr := getString("url_params"); upStr != "" {
+		for k, v := range parseDictString(upStr) {
+			customFields[k] = v
+		}
+	}
+	if offerCode := getString("offer_code"); offerCode != "" {
+		customFields["offer_code"] = offerCode
+	}
+	var orderCustomFields map[string]string
+	if len(customFields) > 0 {
+		orderCustomFields = customFields
 	}
 
 	order := &integrations.Order{
@@ -767,45 +1059,65 @@ func normalizeGumroadWebhook(raw map[string]any) (*integrations.NormalizedWebhoo
 		Provider:    integrations.ProviderGumroad,
 		ProductID:   productID,
 		ProductName: getString("product_name"),
-		VariantID:   getString("variant_id"),
+		VariantID:   "",
 		VariantName: variantName,
 		Customer: integrations.Customer{
-			ID:      email,
-			Email:   email,
-			Name:    fullName,
-			Country: getString("ip_country"),
+			ID:        customerID,
+			Email:     email,
+			Name:      fullName,
+			Country:   getString("ip_country"),
+			IPAddress: "",
 		},
 		LicenseKey:          licenseKey,
 		PriceCents:          priceCents,
-		Currency:            currency,
+		Currency:            "usd",
+		TaxCents:            0,
+		DiscountCents:       0,
 		Refunded:            refunded,
-		RefundedAmountCents: getInt("refunded_amount_cents"),
+		RefundedAmountCents: refundedAmountCents,
 		Disputed:            disputed,
 		SubscriptionID:      subscriptionID,
 		OrderDate:           occurredAt,
+		CustomFields:        orderCustomFields,
 		RawData:             raw,
 	}
 
 	var sub *integrations.Subscription
 	if subscriptionID != "" {
 		subStatus := integrations.SubscriptionStatusActive
-		if cancelled {
+		switch {
+		case cancelled:
 			subStatus = integrations.SubscriptionStatusCancelled
+		case resourceName == "subscription_ended":
+			subStatus = integrations.SubscriptionStatusExpired
+		case resourceName == "subscription_paused":
+			subStatus = integrations.SubscriptionStatusPaused
 		}
 		sub = &integrations.Subscription{
 			ID:            subscriptionID,
 			Provider:      integrations.ProviderGumroad,
 			ProductID:     productID,
-			CustomerID:    email,
+			CustomerID:    customerID,
 			CustomerEmail: email,
 			Status:        subStatus,
 			LicenseKey:    licenseKey,
+			CancelledAt:   nil,
 			CreatedAt:     occurredAt,
 			RawData:       raw,
 		}
 	}
 
+	// Per Gumroad specification (https://gumroad.com/ping):
+	// "Deduplicate on sale_id together with resource_name, not on sale_id alone.
+	// A refund carries the same sale_id as the sale it reverses."
 	eventID := saleID
+	if resourceName != "" && resourceName != "sale" {
+		eventID = fmt.Sprintf("%s:%s", saleID, resourceName)
+	} else if refunded {
+		eventID = fmt.Sprintf("%s:refund", saleID)
+	} else if disputed {
+		eventID = fmt.Sprintf("%s:dispute", saleID)
+	}
 	if eventID == "" {
 		eventID = fmt.Sprintf("evt_%d", occurredAt.UnixNano())
 	}
